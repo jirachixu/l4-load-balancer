@@ -1,0 +1,242 @@
+use mio::{Poll, net, Events, Token, Interest, Waker};
+use slab::Slab;
+use std::io::{Read, Write};
+use std::net::Shutdown;
+use std::sync::{Arc, RwLock, atomic::{AtomicUsize, Ordering}};
+use ctrlc;
+
+// Use usize::MAX for the listener token and usize::MAX - 1 for the waker token to avoid conflicts with other tokens.
+const LISTENER_TOKEN: Token = Token(usize::MAX);
+const WAKER_TOKEN: Token = Token(usize::MAX - 1);
+
+/// A structure representing a proxy session between a client and a server.
+/// This helps the proxy accurately mirror the state of the connection between the client and server, 
+/// including any buffered data and whether either side has closed the connection.
+/// This is important for bidirectional data transfer and graceful shutdown of the connection.
+struct ProxySession {
+    client: net::TcpStream,
+    server: net::TcpStream,
+    client_buffer: Vec<u8>,
+    server_buffer: Vec<u8>,
+    client_closed: bool,
+    server_closed: bool,
+}
+
+pub fn start_event_loop(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // Polls for readiness events (is the socket ready to read/write), watching file descriptors for events. 
+    // This is the main entry point to Mio's event loop.
+    let mut poll = Poll::new()?;
+    // Holds ready events when the loop is running. 
+    // This is a collection of events that have occurred since the last time the event loop was run.
+    let mut events = Events::with_capacity(1024);
+    // parse() parses bind_addr into a SocketAddr.
+    let mut listener = net::TcpListener::bind(bind_addr.parse()?)?;
+    // Gets the registry from the Poll instance and registers the listener with a token and interest in readable events.
+    poll.registry().register(&mut listener, LISTENER_TOKEN, Interest::READABLE)?;
+    // Waker is used to wake up the event loop from another thread.
+    let waker = Arc::new(Waker::new(poll.registry(), WAKER_TOKEN)?);
+    let waker_clone = waker.clone();
+
+    // This HashMap is necessary because mio only provides a Token to identify which socket is ready, 
+    // but it doesn't provide the actual socket itself.
+    let mut sessions: Slab<ProxySession> = Slab::new();
+
+    let mut healthy_servers = Arc::new(RwLock::new(
+        vec!["127.0.0.1:9000", "127.0.0.1:9001", "127.0.0.1:9002", "127.0.0.1:9003", "127.0.0.1:9004"])
+    );
+    let current_server_index = Arc::new(AtomicUsize::new(0));
+
+    ctrlc::set_handler(move || {
+        println!("Ctrl-C received, shutting down...");
+        let _ = waker_clone.wake();
+    }).expect("Error setting Ctrl-C handler");
+
+    let mut is_shutting_down = false;
+
+    loop {
+        poll.poll(&mut events, None)?;
+
+        for event in events.iter() {
+            match event.token() {
+                WAKER_TOKEN => {
+                    is_shutting_down = true;
+                }
+                LISTENER_TOKEN => {
+                    if !is_shutting_down {
+                        loop {
+                            match listener.accept() {
+                                Ok((client_stream, _)) => {
+                                    let addr = {
+                                        let servers = healthy_servers.read().unwrap();
+                                        if servers.is_empty() {
+                                            eprintln!("No healthy servers available");
+                                            continue;
+                                        }
+                                        let index = current_server_index.fetch_add(1, Ordering::SeqCst) % servers.len();
+                                        servers[index]
+                                    };
+                                    let server_stream = net::TcpStream::connect(addr.parse()?)?;
+                                    let key = sessions.insert(ProxySession {
+                                        client: client_stream,
+                                        server: server_stream,
+                                        client_buffer: Vec::new(),
+                                        server_buffer: Vec::new(),
+                                        client_closed: false,
+                                        server_closed: false,
+                                    });
+                                    // Slab is a pre-allocated array that allows for efficient insertion and removal of elements.
+                                    // We calculate the tokens for the client and server streams based on the key in the slab.
+                                    // The client token is the key shifted left by 1, and the server token is the key shifted left 
+                                    // by 1 and then OR'd with 1 (flips the least significant bit, adding 1 in this case since a 
+                                    // left bit shift turns the least significant bit to 0, i.e. an even number). 
+                                    // We can find the key using the token by doing a right shift.
+                                    let client_token = Token(key << 1);
+                                    let server_token = Token((key << 1) | 1);
+                                    poll.registry().register(&mut sessions[key].client, client_token, Interest::READABLE)?;
+                                    poll.registry().register(&mut sessions[key].server, server_token, Interest::READABLE)?;
+                                }
+                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    break;
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to accept connection: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+                _token => {
+                    // TODO: Handle other tokens
+                    let key = _token.0 >> 1;
+                    let client_token = Token(key << 1);
+                    let server_token = Token((key << 1) | 1);
+                    let session = &mut sessions[key];
+                    // Look at the lowest bit of the token
+                    match _token.0 & 1 {
+                        0 => {
+                            // This is the client token
+                            // Check whether it's a read or write event.
+                            if event.is_readable() {
+                                loop {
+                                    // Read data from the client into a buffer. If the client has closed the connection, 
+                                    // mark it as closed and deregister it from the poller. If data is read, 
+                                    // append it to the server buffer and reregister the server for writable events. 
+                                    // If the read would block, break out of the loop. If there's an error, log it and break.
+                                    let mut buf = [0; 4096];
+                                    match session.client.read(&mut buf) {
+                                        Ok(0) => {
+                                            // Client closed the connection
+                                            session.client_closed = true;
+                                            session.server.shutdown(Shutdown::Write)?;
+                                            poll.registry().deregister(&mut session.client)?;
+                                            break;
+                                        }
+                                        Ok(n) => {
+                                            session.server_buffer.extend_from_slice(&buf[..n]);
+                                            poll.registry().reregister(&mut session.server, server_token, Interest::READABLE | Interest::WRITABLE)?;
+                                        }
+                                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Failed to read from client: {}", e);
+                                            break;
+                                        }
+                                    }
+                                }
+                            } else if event.is_writable() {
+                                if !session.client_buffer.is_empty() {
+                                    loop {
+                                        match session.client.write(&session.client_buffer) {
+                                            Ok(0) => {
+                                                // This shouldn't happen, but if it does, we treat it as a closed connection.
+                                                session.client_closed = true;
+                                                session.server.shutdown(Shutdown::Write)?;
+                                                poll.registry().deregister(&mut session.client)?;
+                                                break;
+                                            }
+                                            Ok(n) => {
+                                                session.client_buffer.drain(..n);
+                                                if session.client_buffer.is_empty() {
+                                                    poll.registry().reregister(&mut session.client, client_token, Interest::READABLE)?;
+                                                }
+                                            }
+                                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => { break; }
+                                            Err(e) => {
+                                                eprintln!("Failed to write to client: {}", e);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            // This is the server token
+                            if event.is_readable() {
+                                loop {
+                                    let mut buf = [0; 4096];
+                                    match session.server.read(&mut buf) {
+                                        Ok(0) => {
+                                            // Server closed the connection
+                                            session.server_closed = true;
+                                            session.client.shutdown(Shutdown::Write)?;
+                                            poll.registry().deregister(&mut session.server)?;
+                                            break;
+                                        }
+                                        Ok(n) => {
+                                            session.client_buffer.extend_from_slice(&buf[..n]);
+                                            poll.registry().reregister(&mut session.client, client_token, Interest::READABLE | Interest::WRITABLE)?;
+                                        }
+                                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Failed to read from server: {}", e);
+                                            break;
+                                        }
+                                    }
+                                }
+                            } else if event.is_writable() {
+                                if !session.server_buffer.is_empty() {
+                                    loop {
+                                        match session.server.write(&session.server_buffer) {
+                                            Ok(0) => {
+                                                // This shouldn't happen, but if it does, we treat it as a closed connection.
+                                                session.server_closed = true;
+                                                session.client.shutdown(Shutdown::Write)?;
+                                                poll.registry().deregister(&mut session.server)?;
+                                                break;
+                                            }
+                                            Ok(n) => {
+                                                session.server_buffer.drain(..n);
+                                                if session.server_buffer.is_empty() {
+                                                    poll.registry().reregister(&mut session.server, server_token, Interest::READABLE)?;
+                                                }
+                                            }
+                                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => { break; }
+                                            Err(e) => {
+                                                eprintln!("Failed to write to server: {}", e);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if session.server_closed && session.client_closed && session.server_buffer.is_empty() && session.client_buffer.is_empty() {
+                        // Both sides have closed the connection, remove the session from the slab.
+                        sessions.remove(key);
+                    }
+                }
+            }
+        }
+        if is_shutting_down && sessions.is_empty() {
+            println!("All sessions closed, exiting event loop gracefully.");
+            break;
+        }
+    }
+
+    Ok(())
+}

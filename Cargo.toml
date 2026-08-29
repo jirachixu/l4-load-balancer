@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 ctrlc = "3.5.2"
+mio = { version = "1.2.2", features = ["os-poll", "net"] }
+slab = "0.4.12"
