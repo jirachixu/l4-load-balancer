@@ -4,11 +4,11 @@ use clap::Parser;
 
 #[derive(Parser)]
 struct Config {
-    #[arg(short, long, default_value = "0.0.0.0:8080")]
+    #[arg(long, default_value = "0.0.0.0:8080")]
     bind_addr: String,
 
     // Accept multiple IPs separated by spaces: --backends 127.0.0.1:9000 127.0.0.1:9001
-    #[arg(short, long, value_delimiter = ' ')]
+    #[arg(num_args = 1.., long, value_delimiter = ' ')]
     backends: Vec<String>,
 }
 

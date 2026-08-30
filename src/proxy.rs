@@ -149,7 +149,6 @@ pub fn start_event_loop(bind_addr: &str, backends: &Vec<std::net::SocketAddr>) -
                     }
                 }
                 _token => {
-                    // TODO: Handle other tokens
                     let key = _token.0 >> 1;
                     let client_token = Token(key << 1);
                     let server_token = Token((key << 1) | 1);
@@ -170,42 +169,9 @@ pub fn start_event_loop(bind_addr: &str, backends: &Vec<std::net::SocketAddr>) -
                                         Ok(0) => {
                                             // Client closed the connection
                                             session.client_closed = true;
-                                            // Shut down the server's write half to signal that no more data will be sent to it.
-                                            // Server can still be read from, so don't deregister it yet.
-                                            match session.server.shutdown(Shutdown::Write) {
-                                                Ok(()) => {}
-                                                Err(ref e) if e.kind() == std::io::ErrorKind::NotConnected => {
-                                                    // The server might have already closed the connection, so we can ignore this error.
-                                                }
-                                                Err(ref e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                                                    // The server might have already closed the connection, so we can ignore this error.
-                                                }
-                                                Err(e) => eprintln!("Failed to shutdown server: {}", e),
-                                            }
-                                            poll.registry().deregister(&mut session.client)?;
-                                            break;
-                                        }
-                                        Ok(n) => {
-                                            total_throughput.fetch_add(n, Ordering::SeqCst);
-                                            session.server_buffer.extend_from_slice(&buf[..n]);
-                                            poll.registry().reregister(&mut session.server, server_token, Interest::READABLE | Interest::WRITABLE)?;
-                                        }
-                                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                            break;
-                                        }
-                                        Err(e) => {
-                                            eprintln!("Failed to read from client: {}", e);
-                                            break;
-                                        }
-                                    }
-                                }
-                            } else if event.is_writable() {
-                                if !session.client_buffer.is_empty() {
-                                    loop {
-                                        match session.client.write(&session.client_buffer) {
-                                            Ok(0) => {
-                                                // This shouldn't happen, but if it does, we treat it as a closed connection.
-                                                session.client_closed = true;
+                                            if session.server_buffer.is_empty() {
+                                                // Shut down the server's write half to signal that no more data will be sent to it.
+                                                // Server can still be read from, so don't deregister it yet.
                                                 match session.server.shutdown(Shutdown::Write) {
                                                     Ok(()) => {}
                                                     Err(ref e) if e.kind() == std::io::ErrorKind::NotConnected => {
@@ -216,13 +182,107 @@ pub fn start_event_loop(bind_addr: &str, backends: &Vec<std::net::SocketAddr>) -
                                                     }
                                                     Err(e) => eprintln!("Failed to shutdown server: {}", e),
                                                 }
-                                                poll.registry().deregister(&mut session.client)?;
+                                                let _ = poll.registry().deregister(&mut session.client);
+                                            } else {
+                                                // There is still data to send to the server; make sure it's registered for WRITABLE.
+                                                if let Err(e) = poll.registry().reregister(&mut session.server, server_token, Interest::READABLE | Interest::WRITABLE) {
+                                                    if e.kind() == std::io::ErrorKind::NotFound {
+                                                        let _ = poll.registry().register(&mut session.server, server_token, Interest::READABLE | Interest::WRITABLE);
+                                                    }
+                                                }
+                                            }
+                                            break;
+                                        }
+                                        Ok(n) => {
+                                            total_throughput.fetch_add(n, Ordering::SeqCst);
+                                            session.server_buffer.extend_from_slice(&buf[..n]);
+                                            
+                                            // Edge-triggered epoll fix: Try writing immediately
+                                            loop {
+                                                match session.server.write(&session.server_buffer) {
+                                                    Ok(0) => break,
+                                                    Ok(nw) => {
+                                                        session.server_buffer.drain(..nw);
+                                                        if session.server_buffer.is_empty() && session.client_closed {
+                                                            let _ = session.server.shutdown(Shutdown::Write);
+                                                            let _ = poll.registry().deregister(&mut session.server);
+                                                        }
+                                                        if session.server_buffer.is_empty() {
+                                                            break;
+                                                        }
+                                                    }
+                                                    Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                                                    Err(e) => {
+                                                        eprintln!("Failed to write to server immediately: {}", e);
+                                                        break;
+                                                    }
+                                                }
+                                            }
+
+                                            let mut interest = Interest::READABLE;
+                                            if !session.server_buffer.is_empty() {
+                                                interest |= Interest::WRITABLE;
+                                            }
+                                            if let Err(e) = poll.registry().reregister(&mut session.server, server_token, interest) {
+                                                if e.kind() == std::io::ErrorKind::NotFound {
+                                                    let _ = poll.registry().register(&mut session.server, server_token, interest);
+                                                }
+                                            }
+                                        }
+                                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Failed to read from client: {}", e);
+                                            break;
+                                        }
+                                    }
+                                }
+                            } 
+                            if event.is_writable() {
+                                if !session.client_buffer.is_empty() {
+                                    loop {
+                                        match session.client.write(&session.client_buffer) {
+                                            Ok(0) => {
+                                                // This shouldn't happen, but if it does, we treat it as a closed connection.
+                                                session.client_closed = true;
+                                                if session.server_buffer.is_empty() {
+                                                    // If the server buffer is empty, we can shut down the server's write half.
+                                                    match session.server.shutdown(Shutdown::Write) {
+                                                        Ok(()) => {}
+                                                        Err(ref e) if e.kind() == std::io::ErrorKind::NotConnected => {
+                                                            // The server might have already closed the connection, so we can ignore this error.
+                                                        }
+                                                        Err(ref e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                                                            // The server might have already closed the connection, so we can ignore this error.
+                                                        }
+                                                        Err(e) => eprintln!("Failed to shutdown server: {}", e),
+                                                    }
+                                                    let _ = poll.registry().deregister(&mut session.client);
+                                                }
                                                 break;
                                             }
                                             Ok(n) => {
                                                 session.client_buffer.drain(..n);
-                                                if session.client_buffer.is_empty() {
-                                                    poll.registry().reregister(&mut session.client, client_token, Interest::READABLE)?;
+                                                if session.client_buffer.is_empty() && session.server_closed {
+                                                    // Buffer fully drained and server already sent EOF; finalize the half-close.
+                                                    match session.client.shutdown(Shutdown::Write) {
+                                                        Ok(()) => {}
+                                                        Err(ref e) if e.kind() == std::io::ErrorKind::NotConnected => {}
+                                                        Err(ref e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                                                        Err(e) => eprintln!("Failed to shutdown client: {}", e),
+                                                    }
+                                                    let _ = poll.registry().deregister(&mut session.server);
+                                                } else {
+                                                    let mut interest = Interest::READABLE;
+                                                    if !session.client_buffer.is_empty() {
+                                                        interest |= Interest::WRITABLE;
+                                                    }
+                                                    if let Err(e) = poll.registry().reregister(&mut session.client, client_token, interest) {
+                                                        if e.kind() == std::io::ErrorKind::NotFound {
+                                                            let _ = poll.registry().register(&mut session.client, client_token, interest);
+                                                        }
+                                                    }
                                                 }
                                             }
                                             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => { break; }
@@ -244,40 +304,7 @@ pub fn start_event_loop(bind_addr: &str, backends: &Vec<std::net::SocketAddr>) -
                                         Ok(0) => {
                                             // Server closed the connection
                                             session.server_closed = true;
-                                            match session.client.shutdown(Shutdown::Write) {
-                                                Ok(()) => {}
-                                                Err(ref e) if e.kind() == std::io::ErrorKind::NotConnected => {
-                                                    // The client might have already closed the connection, so we can ignore this error.
-                                                }
-                                                Err(ref e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                                                    // The client might have already closed the connection, so we can ignore this error.
-                                                }
-                                                Err(e) => eprintln!("Failed to shutdown client: {}", e),
-                                            }
-                                            poll.registry().deregister(&mut session.server)?;
-                                            break;
-                                        }
-                                        Ok(n) => {
-                                            total_throughput.fetch_add(n, Ordering::SeqCst);
-                                            session.client_buffer.extend_from_slice(&buf[..n]);
-                                            poll.registry().reregister(&mut session.client, client_token, Interest::READABLE | Interest::WRITABLE)?;
-                                        }
-                                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                            break;
-                                        }
-                                        Err(e) => {
-                                            eprintln!("Failed to read from server: {}", e);
-                                            break;
-                                        }
-                                    }
-                                }
-                            } else if event.is_writable() {
-                                if !session.server_buffer.is_empty() {
-                                    loop {
-                                        match session.server.write(&session.server_buffer) {
-                                            Ok(0) => {
-                                                // This shouldn't happen, but if it does, we treat it as a closed connection.
-                                                session.server_closed = true;
+                                            if session.client_buffer.is_empty() {
                                                 match session.client.shutdown(Shutdown::Write) {
                                                     Ok(()) => {}
                                                     Err(ref e) if e.kind() == std::io::ErrorKind::NotConnected => {
@@ -288,13 +315,106 @@ pub fn start_event_loop(bind_addr: &str, backends: &Vec<std::net::SocketAddr>) -
                                                     }
                                                     Err(e) => eprintln!("Failed to shutdown client: {}", e),
                                                 }
-                                                poll.registry().deregister(&mut session.server)?;
+                                                let _ = poll.registry().deregister(&mut session.server);
+                                            } else {
+                                                // There is still data to send to the client; make sure it's registered for WRITABLE.
+                                                if let Err(e) = poll.registry().reregister(&mut session.client, client_token, Interest::READABLE | Interest::WRITABLE) {
+                                                    if e.kind() == std::io::ErrorKind::NotFound {
+                                                        let _ = poll.registry().register(&mut session.client, client_token, Interest::READABLE | Interest::WRITABLE);
+                                                    }
+                                                }
+                                            }
+                                            break;
+                                        }
+                                        Ok(n) => {
+                                            total_throughput.fetch_add(n, Ordering::SeqCst);
+                                            session.client_buffer.extend_from_slice(&buf[..n]);
+                                            
+                                            // Edge-triggered epoll fix: Try writing immediately
+                                            loop {
+                                                match session.client.write(&session.client_buffer) {
+                                                    Ok(0) => break,
+                                                    Ok(nw) => {
+                                                        session.client_buffer.drain(..nw);
+                                                        if session.client_buffer.is_empty() && session.server_closed {
+                                                            let _ = session.client.shutdown(Shutdown::Write);
+                                                            let _ = poll.registry().deregister(&mut session.client);
+                                                        }
+                                                        if session.client_buffer.is_empty() {
+                                                            break;
+                                                        }
+                                                    }
+                                                    Err(ref err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                                                    Err(e) => {
+                                                        eprintln!("Failed to write to client immediately: {}", e);
+                                                        break;
+                                                    }
+                                                }
+                                            }
+
+                                            let mut interest = Interest::READABLE;
+                                            if !session.client_buffer.is_empty() {
+                                                interest |= Interest::WRITABLE;
+                                            }
+                                            if let Err(e) = poll.registry().reregister(&mut session.client, client_token, interest) {
+                                                if e.kind() == std::io::ErrorKind::NotFound {
+                                                    let _ = poll.registry().register(&mut session.client, client_token, interest);
+                                                }
+                                            }
+                                        }
+                                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Failed to read from server: {}", e);
+                                            break;
+                                        }
+                                    }
+                                }
+                            } 
+                            if event.is_writable() {
+                                if !session.server_buffer.is_empty() {
+                                    loop {
+                                        match session.server.write(&session.server_buffer) {
+                                            Ok(0) => {
+                                                // This shouldn't happen, but if it does, we treat it as a closed connection.
+                                                session.server_closed = true;
+                                                if session.client_buffer.is_empty() {
+                                                    match session.client.shutdown(Shutdown::Write) {
+                                                        Ok(()) => {}
+                                                        Err(ref e) if e.kind() == std::io::ErrorKind::NotConnected => {
+                                                            // The client might have already closed the connection, so we can ignore this error.
+                                                        }
+                                                        Err(ref e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                                                            // The client might have already closed the connection, so we can ignore this error.
+                                                        }
+                                                        Err(e) => eprintln!("Failed to shutdown client: {}", e),
+                                                    }
+                                                    let _ = poll.registry().deregister(&mut session.server);
+                                                }
                                                 break;
                                             }
                                             Ok(n) => {
                                                 session.server_buffer.drain(..n);
-                                                if session.server_buffer.is_empty() {
-                                                    poll.registry().reregister(&mut session.server, server_token, Interest::READABLE)?;
+                                                if session.server_buffer.is_empty() && session.client_closed {
+                                                    // Buffer fully drained and client already sent EOF; finalize the half-close.
+                                                    match session.server.shutdown(Shutdown::Write) {
+                                                        Ok(()) => {}
+                                                        Err(ref e) if e.kind() == std::io::ErrorKind::NotConnected => {}
+                                                        Err(ref e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                                                        Err(e) => eprintln!("Failed to shutdown server: {}", e),
+                                                    }
+                                                    let _ = poll.registry().deregister(&mut session.client);
+                                                } else {
+                                                    let mut interest = Interest::READABLE;
+                                                    if !session.server_buffer.is_empty() {
+                                                        interest |= Interest::WRITABLE;
+                                                    }
+                                                    if let Err(e) = poll.registry().reregister(&mut session.server, server_token, interest) {
+                                                        if e.kind() == std::io::ErrorKind::NotFound {
+                                                            let _ = poll.registry().register(&mut session.server, server_token, interest);
+                                                        }
+                                                    }
                                                 }
                                             }
                                             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => { break; }
