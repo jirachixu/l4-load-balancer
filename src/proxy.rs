@@ -1,7 +1,8 @@
 use mio::{Poll, net, Events, Token, Interest, Waker};
 use slab::Slab;
 use std::io::{Read, Write};
-use std::net::Shutdown;
+use std::thread;
+use std::net::{self as stdnet, Shutdown};
 use std::sync::{Arc, RwLock, atomic::{AtomicUsize, Ordering}};
 use ctrlc;
 
@@ -22,7 +23,7 @@ struct ProxySession {
     server_closed: bool,
 }
 
-pub fn start_event_loop(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub fn start_event_loop(bind_addr: &str, backends: &Vec<std::net::SocketAddr>) -> Result<(), Box<dyn std::error::Error>> {
     // Polls for readiness events (is the socket ready to read/write), watching file descriptors for events. 
     // This is the main entry point to Mio's event loop.
     let mut poll = Poll::new()?;
@@ -41,10 +42,51 @@ pub fn start_event_loop(bind_addr: &str) -> Result<(), Box<dyn std::error::Error
     // but it doesn't provide the actual socket itself.
     let mut sessions: Slab<ProxySession> = Slab::new();
 
-    let mut healthy_servers = Arc::new(RwLock::new(
-        vec!["127.0.0.1:9000", "127.0.0.1:9001", "127.0.0.1:9002", "127.0.0.1:9003", "127.0.0.1:9004"])
-    );
+    let healthy_servers = Arc::new(RwLock::new(backends.clone()));
+    let all_servers = backends.clone();
     let current_server_index = Arc::new(AtomicUsize::new(0));
+
+    let health_check_healthy_servers = healthy_servers.clone();
+
+    // Health check thread, same as in simple_proxy
+    thread::spawn(move || {
+        loop {
+            let checked_servers = all_servers.iter().filter(|addr| {
+                match stdnet::TcpStream::connect_timeout(addr, std::time::Duration::from_secs(3)) {
+                    Ok(stream) => {
+                        // If we can connect, the server is healthy. Close the connection immediately.
+                        let _ = stream.shutdown(Shutdown::Both);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }).cloned().collect::<Vec<std::net::SocketAddr>>();
+            *health_check_healthy_servers.write().unwrap() = checked_servers;
+            thread::sleep(std::time::Duration::from_secs(5));
+        }
+    });
+
+    let num_connections = Arc::new(AtomicUsize::new(0));
+    let total_throughput = Arc::new(AtomicUsize::new(0));
+
+    let metrics_num_connections = num_connections.clone();
+    let metrics_total_throughput = total_throughput.clone();
+
+    // Metrics thread to print the number of active connections and total throughput every 5 seconds, avoiding console spam.
+    thread::spawn(move || {
+        loop {
+            // Use Ordering::Relaxed here because we don't need a strict ordering of operations for metrics; 
+            // we just want to read the current values. Orering::SeqCst is used in the main loop to ensure that 
+            // increments and decrements are seen in the correct order that they actually occurred, which takes more 
+            // time and CPU.
+            let active_connections = metrics_num_connections.load(Ordering::Relaxed);
+            let throughput = metrics_total_throughput.load(Ordering::Relaxed);
+            println!("----- Load Balancer Metrics -----");
+            println!("Current number of active connections: {}", active_connections);
+            println!("Total throughput (bytes): {}", throughput);
+            thread::sleep(std::time::Duration::from_secs(5));
+        }
+    });
 
     ctrlc::set_handler(move || {
         println!("Ctrl-C received, shutting down...");
@@ -75,7 +117,8 @@ pub fn start_event_loop(bind_addr: &str) -> Result<(), Box<dyn std::error::Error
                                         let index = current_server_index.fetch_add(1, Ordering::SeqCst) % servers.len();
                                         servers[index]
                                     };
-                                    let server_stream = net::TcpStream::connect(addr.parse()?)?;
+                                    let server_stream = net::TcpStream::connect(addr)?;
+                                    num_connections.fetch_add(1, Ordering::SeqCst);
                                     let key = sessions.insert(ProxySession {
                                         client: client_stream,
                                         server: server_stream,
@@ -127,11 +170,23 @@ pub fn start_event_loop(bind_addr: &str) -> Result<(), Box<dyn std::error::Error
                                         Ok(0) => {
                                             // Client closed the connection
                                             session.client_closed = true;
-                                            session.server.shutdown(Shutdown::Write)?;
+                                            // Shut down the server's write half to signal that no more data will be sent to it.
+                                            // Server can still be read from, so don't deregister it yet.
+                                            match session.server.shutdown(Shutdown::Write) {
+                                                Ok(()) => {}
+                                                Err(ref e) if e.kind() == std::io::ErrorKind::NotConnected => {
+                                                    // The server might have already closed the connection, so we can ignore this error.
+                                                }
+                                                Err(ref e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                                                    // The server might have already closed the connection, so we can ignore this error.
+                                                }
+                                                Err(e) => eprintln!("Failed to shutdown server: {}", e),
+                                            }
                                             poll.registry().deregister(&mut session.client)?;
                                             break;
                                         }
                                         Ok(n) => {
+                                            total_throughput.fetch_add(n, Ordering::SeqCst);
                                             session.server_buffer.extend_from_slice(&buf[..n]);
                                             poll.registry().reregister(&mut session.server, server_token, Interest::READABLE | Interest::WRITABLE)?;
                                         }
@@ -151,7 +206,16 @@ pub fn start_event_loop(bind_addr: &str) -> Result<(), Box<dyn std::error::Error
                                             Ok(0) => {
                                                 // This shouldn't happen, but if it does, we treat it as a closed connection.
                                                 session.client_closed = true;
-                                                session.server.shutdown(Shutdown::Write)?;
+                                                match session.server.shutdown(Shutdown::Write) {
+                                                    Ok(()) => {}
+                                                    Err(ref e) if e.kind() == std::io::ErrorKind::NotConnected => {
+                                                        // The server might have already closed the connection, so we can ignore this error.
+                                                    }
+                                                    Err(ref e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                                                        // The server might have already closed the connection, so we can ignore this error.
+                                                    }
+                                                    Err(e) => eprintln!("Failed to shutdown server: {}", e),
+                                                }
                                                 poll.registry().deregister(&mut session.client)?;
                                                 break;
                                             }
@@ -180,11 +244,21 @@ pub fn start_event_loop(bind_addr: &str) -> Result<(), Box<dyn std::error::Error
                                         Ok(0) => {
                                             // Server closed the connection
                                             session.server_closed = true;
-                                            session.client.shutdown(Shutdown::Write)?;
+                                            match session.client.shutdown(Shutdown::Write) {
+                                                Ok(()) => {}
+                                                Err(ref e) if e.kind() == std::io::ErrorKind::NotConnected => {
+                                                    // The client might have already closed the connection, so we can ignore this error.
+                                                }
+                                                Err(ref e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                                                    // The client might have already closed the connection, so we can ignore this error.
+                                                }
+                                                Err(e) => eprintln!("Failed to shutdown client: {}", e),
+                                            }
                                             poll.registry().deregister(&mut session.server)?;
                                             break;
                                         }
                                         Ok(n) => {
+                                            total_throughput.fetch_add(n, Ordering::SeqCst);
                                             session.client_buffer.extend_from_slice(&buf[..n]);
                                             poll.registry().reregister(&mut session.client, client_token, Interest::READABLE | Interest::WRITABLE)?;
                                         }
@@ -204,7 +278,16 @@ pub fn start_event_loop(bind_addr: &str) -> Result<(), Box<dyn std::error::Error
                                             Ok(0) => {
                                                 // This shouldn't happen, but if it does, we treat it as a closed connection.
                                                 session.server_closed = true;
-                                                session.client.shutdown(Shutdown::Write)?;
+                                                match session.client.shutdown(Shutdown::Write) {
+                                                    Ok(()) => {}
+                                                    Err(ref e) if e.kind() == std::io::ErrorKind::NotConnected => {
+                                                        // The client might have already closed the connection, so we can ignore this error.
+                                                    }
+                                                    Err(ref e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                                                        // The client might have already closed the connection, so we can ignore this error.
+                                                    }
+                                                    Err(e) => eprintln!("Failed to shutdown client: {}", e),
+                                                }
                                                 poll.registry().deregister(&mut session.server)?;
                                                 break;
                                             }
@@ -226,6 +309,7 @@ pub fn start_event_loop(bind_addr: &str) -> Result<(), Box<dyn std::error::Error
                         }
                     }
                     if session.server_closed && session.client_closed && session.server_buffer.is_empty() && session.client_buffer.is_empty() {
+                        num_connections.fetch_sub(1, Ordering::SeqCst);
                         // Both sides have closed the connection, remove the session from the slab.
                         sessions.remove(key);
                     }
@@ -237,6 +321,5 @@ pub fn start_event_loop(bind_addr: &str) -> Result<(), Box<dyn std::error::Error
             break;
         }
     }
-
     Ok(())
 }
