@@ -1,4 +1,5 @@
 mod proxy_ugly;
+mod proxy_elegant;
 use rlimit;
 use clap::Parser;
 

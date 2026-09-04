@@ -138,6 +138,9 @@ pub fn start_event_loop(bind_addr: &str, backends: &Vec<std::net::SocketAddr>) -
                                     poll.registry().register(&mut sessions[key].client, client_token, Interest::READABLE)?;
                                     poll.registry().register(&mut sessions[key].server, server_token, Interest::READABLE)?;
                                 }
+                                // If accept returns WouldBlock, this means that no connections are currently ready to be accepted 
+                                // (i.e. the socket would block to wait for a connection). In this case, we break out of the loop 
+                                // and wait for the next event. Mio listeners are non-blocking by default.
                                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                                     break;
                                 }
