@@ -1,4 +1,4 @@
-mod proxy;
+mod proxy_ugly;
 use rlimit;
 use clap::Parser;
 
@@ -33,5 +33,5 @@ fn main() {
         }
     }).collect();
 
-    proxy::start_event_loop(&config.bind_addr, &backends).expect("Failed to start proxy event loop");
+    proxy_ugly::start_event_loop(&config.bind_addr, &backends).expect("Failed to start proxy event loop");
 }
