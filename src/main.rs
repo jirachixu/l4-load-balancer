@@ -34,5 +34,5 @@ fn main() {
         }
     }).collect();
 
-    proxy_ugly::start_event_loop(&config.bind_addr, &backends).expect("Failed to start proxy event loop");
+    proxy_elegant::start_event_loop(&config.bind_addr, &backends).expect("Failed to start proxy event loop");
 }

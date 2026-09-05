@@ -1,3 +1,4 @@
+#![allow(warnings)]
 use mio::{Poll, net, Events, Token, Interest, Waker};
 use slab::Slab;
 use std::io::{Read, Write};

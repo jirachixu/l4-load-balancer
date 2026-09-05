@@ -19,12 +19,12 @@ const LISTENER_TOKEN: Token = Token(usize::MAX);
 const WAKER_TOKEN: Token = Token(usize::MAX - 1);
 
 struct ProxySession {
-    client_socket: net::TcpStream,
-    backend_socket: net::TcpStream,
+    client: net::TcpStream,
+    server: net::TcpStream,
     client_buffer: Vec<u8>,
-    backend_buffer: Vec<u8>,
+    server_buffer: Vec<u8>,
     client_closed: bool,
-    backend_closed: bool,
+    server_closed: bool,
 }
 
 pub fn start_event_loop(bind_addr: &str, backends: &[stdnet::SocketAddr]) -> Result<(), Box<dyn std::error::Error>> {
@@ -109,17 +109,17 @@ pub fn start_event_loop(bind_addr: &str, backends: &[stdnet::SocketAddr]) -> Res
                                 };
                                 num_connections.fetch_add(1, Ordering::Relaxed);
                                 let key =  sessions.insert(ProxySession {
-                                    client_socket: client_stream,
-                                    backend_socket: server_stream,
+                                    client: client_stream,
+                                    server: server_stream,
                                     client_buffer: Vec::new(),
-                                    backend_buffer: Vec::new(),
+                                    server_buffer: Vec::new(),
                                     client_closed: false,
-                                    backend_closed: false,
+                                    server_closed: false,
                                 });
                                 let client_token = Token(key << 1);
                                 let server_token = Token((key << 1) | 1);
-                                poll.registry().register(&mut sessions[key].client_socket, client_token, Interest::READABLE)?;
-                                poll.registry().register(&mut sessions[key].backend_socket, server_token, Interest::READABLE)?;
+                                poll.registry().register(&mut sessions[key].client, client_token, Interest::READABLE)?;
+                                poll.registry().register(&mut sessions[key].server, server_token, Interest::READABLE)?;
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                             Err(e) => {
@@ -139,11 +139,104 @@ pub fn start_event_loop(bind_addr: &str, backends: &[stdnet::SocketAddr]) -> Res
 
                     if let Some(session) = sessions.get_mut(key) {
                         // ========= Phase 1: Exhaust Reads =========
+                        if is_client && event.is_readable() && !session.client_closed {
+                            loop {
+                                let mut buf = [0u8; 4096];
+                                match session.client.read(&mut buf) {
+                                    Ok(0) => {
+                                        session.client_closed = true;
+                                        break;
+                                    }
+                                    Ok(n) => {
+                                        session.server_buffer.extend_from_slice(&buf[..n]);
+                                        total_throughput.fetch_add(n, Ordering::Relaxed);
+                                    }
+                                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                    Err(e) => {
+                                        eprintln!("Read error from client: {}", e);
+                                        session.client_closed = true;
+                                        let _ = session.server.shutdown(Shutdown::Write);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if !is_client && event.is_readable() && !session.server_closed {
+                            loop {
+                                let mut buf = [0u8; 4096];
+                                match session.server.read(&mut buf) {
+                                    Ok(0) => {
+                                        session.server_closed = true;
+                                        break;
+                                    }
+                                    Ok(n) => {
+                                        session.client_buffer.extend_from_slice(&buf[..n]);
+                                        total_throughput.fetch_add(n, Ordering::Relaxed);
+                                    }
+                                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                    Err(e) => {
+                                        eprintln!("Read error from backend: {}", e);
+                                        session.server_closed = true;
+                                        let _ = session.client.shutdown(Shutdown::Write);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
 
                         // ========= Phase 2: Exhaust Writes =========
+                        if !session.server_buffer.is_empty() {
+                            loop {
+                                match session.server.write(&session.server_buffer) {
+                                    Ok(n) => {
+                                        session.server_buffer.drain(..n);
+                                        if session.server_buffer.is_empty() {
+                                            break;
+                                        }
+                                    }
+                                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                    Err(e) => {
+                                        eprintln!("Write error to backend: {}", e);
+                                        session.server_closed = true;
+                                        session.server_buffer.clear();
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if !session.client_buffer.is_empty() {
+                            loop {
+                                match session.client.write(&session.client_buffer) {
+                                    Ok(n) => {
+                                        session.client_buffer.drain(..n);
+                                        if session.client_buffer.is_empty() {
+                                            break;
+                                        }
+                                    }
+                                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                    Err(e) => {
+                                        eprintln!("Write error to client: {}", e);
+                                        session.client_closed = true;
+                                        session.client_buffer.clear();
+                                        break;
+                                    }
+                                }
+                            }
+                        }
 
                         // ========= Phase 3: Re-register Sockets and Clean Up =========
-                        
+                        let client_needs_read = !session.client_closed;
+                        let client_needs_write = !session.client_buffer.is_empty();
+                        let server_needs_read = !session.server_closed;
+                        let server_needs_write = !session.server_buffer.is_empty();
+
+                        if !client_needs_read && !client_needs_write && !server_needs_read && !server_needs_write {
+                            num_connections.fetch_sub(1, Ordering::SeqCst);
+                            sessions.remove(key);
+                        } else {
+                            safe_register(&mut poll, &mut session.client, Token(key << 1), client_needs_read, client_needs_write);
+                            safe_register(&mut poll, &mut session.server, Token((key << 1) | 1), server_needs_read, server_needs_write);
+                        }
                     }
                 }
             }
@@ -155,4 +248,33 @@ pub fn start_event_loop(bind_addr: &str, backends: &[stdnet::SocketAddr]) -> Res
     }
 
     Ok(())
+}
+
+/// A helper function to safely reregister a stream with the poller. If the stream is somehow not found, register it instead.
+/// Also handles deregistration if both read and write interests are false. Determines the correct interest based on
+/// whether the stream still needs to read or write.
+pub fn safe_register(poll: &mut Poll, stream: &mut net::TcpStream, token: Token, needs_read: bool, needs_write: bool) {
+    if !needs_read && !needs_write {
+        let _ = poll.registry().deregister(stream);
+        return;
+    }
+
+    let interest = if needs_read && needs_write {
+        Interest::READABLE.add(Interest::WRITABLE)
+    } else if needs_read {
+        Interest::READABLE
+    } else {
+        Interest::WRITABLE
+    };
+
+    if let Err(e) = poll.registry().reregister(stream, token, interest) {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            println!("Stream not found in poll registry, attempting to register instead.");
+            if let Err(e) = poll.registry().register(stream, token, interest) {
+                eprintln!("Failed to register stream: {}", e);
+            }
+        } else {
+            eprintln!("Failed to reregister stream: {}", e);
+        }
+    }
 }
