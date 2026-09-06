@@ -10,10 +10,11 @@
 use mio::{Poll, net, Events, Token, Interest, Waker};
 use slab::Slab;
 use std::io::{Read, Write};
-use std::thread;
+use std::{thread, usize};
 use std::net::{self as stdnet, Shutdown};
 use std::sync::{Arc, RwLock, atomic::{AtomicUsize, Ordering}};
 use ctrlc;
+use std::collections::HashMap;
 
 const LISTENER_TOKEN: Token = Token(usize::MAX);
 const WAKER_TOKEN: Token = Token(usize::MAX - 1);
@@ -25,6 +26,7 @@ struct ProxySession {
     server_buffer: Vec<u8>,
     client_closed: bool,
     server_closed: bool,
+    session_backend: stdnet::SocketAddr,
 }
 
 pub fn start_event_loop(bind_addr: &str, backends: &[stdnet::SocketAddr]) -> Result<(), Box<dyn std::error::Error>> {
@@ -36,10 +38,12 @@ pub fn start_event_loop(bind_addr: &str, backends: &[stdnet::SocketAddr]) -> Res
     let waker = Arc::new(Waker::new(poll.registry(), WAKER_TOKEN)?);
     let all_servers = backends.to_vec().clone();
     let healthy_servers = Arc::new(RwLock::new(backends.to_vec().clone()));
-    let current_server_idx = Arc::new(AtomicUsize::new(0));
+    // let current_server_idx = Arc::new(AtomicUsize::new(0));
     let num_connections = Arc::new(AtomicUsize::new(0));
     let total_throughput = Arc::new(AtomicUsize::new(0));
     let mut is_shutting_down = false;
+    let healthy_servers_map: HashMap<stdnet::SocketAddr, Arc<AtomicUsize>> = backends.to_vec().clone().into_iter()
+        .map(|addr| (addr, Arc::new(AtomicUsize::new(0)))).collect();
 
     let health_check_healthy_servers = healthy_servers.clone();
     thread::spawn(move || {
@@ -97,8 +101,17 @@ pub fn start_event_loop(bind_addr: &str, backends: &[stdnet::SocketAddr]) -> Res
                                         eprintln!("No healthy backend servers available.");
                                         continue;
                                     }
-                                    let idx = current_server_idx.fetch_add(1, Ordering::Relaxed) % servers.len();
-                                    servers[idx]
+                                    let mut min_connections = usize::MAX;
+                                    let mut min_connections_server: stdnet::SocketAddr = servers[0];
+                                    for server in servers.iter() {
+                                        // Should never panic, all servers in config are initialized in healthy_servers_map
+                                        let connections = healthy_servers_map.get(server).unwrap().load(Ordering::Relaxed);
+                                        if connections < min_connections {
+                                            min_connections = connections;
+                                            min_connections_server = *server;
+                                        }
+                                    }
+                                    min_connections_server
                                 };
                                 let server_stream = match net::TcpStream::connect(addr) {
                                     Ok(stream) => stream,
@@ -108,6 +121,8 @@ pub fn start_event_loop(bind_addr: &str, backends: &[stdnet::SocketAddr]) -> Res
                                     }
                                 };
                                 num_connections.fetch_add(1, Ordering::Relaxed);
+                                healthy_servers_map.get(&addr).unwrap().fetch_add(1, Ordering::Relaxed);
+                                println!("Accepted new connection from {}. Total connections: {}", client_stream.peer_addr().unwrap(), num_connections.load(Ordering::Relaxed));
                                 let key =  sessions.insert(ProxySession {
                                     client: client_stream,
                                     server: server_stream,
@@ -115,6 +130,7 @@ pub fn start_event_loop(bind_addr: &str, backends: &[stdnet::SocketAddr]) -> Res
                                     server_buffer: Vec::new(),
                                     client_closed: false,
                                     server_closed: false,
+                                    session_backend: addr,
                                 });
                                 let client_token = Token(key << 1);
                                 let server_token = Token((key << 1) | 1);
@@ -232,6 +248,9 @@ pub fn start_event_loop(bind_addr: &str, backends: &[stdnet::SocketAddr]) -> Res
 
                         if !client_needs_read && !client_needs_write && !server_needs_read && !server_needs_write {
                             num_connections.fetch_sub(1, Ordering::SeqCst);
+                            let addr = session.session_backend;
+                            healthy_servers_map.get(&addr).unwrap().fetch_sub(1, Ordering::Relaxed);
+                            println!("Closing session with backend {}. Total connections: {}", addr, num_connections.load(Ordering::Relaxed));
                             sessions.remove(key);
                         } else {
                             safe_register(&mut poll, &mut session.client, Token(key << 1), client_needs_read, client_needs_write);

@@ -1,0 +1,9 @@
+# address for the proxy itself, for client to connect to
+bind_address = "127.0.0.1:8080"
+
+# define your backend addresses here, you can add as many as you want
+[[backends]]
+address = "127.0.0.1:9000"
+
+[[backends]]
+address = "127.0.0.1:9001"

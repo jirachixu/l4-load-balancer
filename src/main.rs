@@ -1,16 +1,18 @@
-mod proxy_ugly;
 mod proxy_elegant;
 use rlimit;
-use clap::Parser;
+use serde::Deserialize;
+use toml;
+use std::fs;
 
-#[derive(Parser)]
+#[derive(Deserialize, Debug)]
 struct Config {
-    #[arg(long, default_value = "0.0.0.0:8080")]
-    bind_addr: String,
+    bind_address: String,
+    backends: Vec<Backend>,
+}
 
-    // Accept multiple IPs separated by spaces: --backends 127.0.0.1:9000 127.0.0.1:9001
-    #[arg(num_args = 1.., long, value_delimiter = ' ')]
-    backends: Vec<String>,
+#[derive(Deserialize, Debug)]
+struct Backend {
+    address: String,
 }
 
 fn main() {
@@ -21,18 +23,20 @@ fn main() {
         eprintln!("You may need to run the program with elevated privileges or adjust your system's limits.");
     }
 
-    let config = Config::parse();
-    println!("Starting proxy server on {} with backends: {:?}", config.bind_addr, config.backends);
+    let contents = fs::read_to_string("config.toml").expect("Failed to read config!");
+    let config: Config = toml::from_str(&contents).expect("Failed to parse config!");
 
     let backends: Vec<std::net::SocketAddr> = config.backends.iter().filter_map(|backend| {
-        match backend.parse::<std::net::SocketAddr>() {
+        match backend.address.parse::<std::net::SocketAddr>() {
             Ok(addr) => Some(addr),
             Err(e) => {
-                eprintln!("Invalid backend address '{}': {}", backend, e);
+                eprintln!("Invalid backend address '{}': {}", backend.address, e);
                 None
             }
         }
     }).collect();
 
-    proxy_elegant::start_event_loop(&config.bind_addr, &backends).expect("Failed to start proxy event loop");
+    println!("Starting proxy server on {} with backends: {:?}", config.bind_address, backends);
+
+    proxy_elegant::start_event_loop(&config.bind_address, &backends).expect("Failed to start proxy event loop");
 }
